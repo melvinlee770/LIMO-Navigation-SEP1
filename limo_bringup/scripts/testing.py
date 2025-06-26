@@ -70,7 +70,7 @@ def send_goal_with_recovery(x, y, yaw_rad):
 
 if __name__ == '__main__':
     try:
-        send_goal_with_recovery(1.94, 1.12, 0.0)
+        send_goal_with_recovery(1.99, 0.32, 0.0)
     except rospy.ROSInterruptException:
         rospy.loginfo("Goal interrupted.")
 
