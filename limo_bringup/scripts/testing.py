@@ -1,13 +1,22 @@
 #!/usr/bin/env python
+# -*- coding: utf-8 -*-
 
 import rospy
 import actionlib
+import math
+from sensor_msgs.msg import LaserScan
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
 from tf.transformations import quaternion_from_euler
 from geometry_msgs.msg import Twist
 
+scan_data = None
+
+def scan_callback(msg):
+    global scan_data
+    scan_data = msg
+
 def send_goal_with_recovery(x, y, yaw_rad):
-    rospy.init_node('send_navigation_goal_with_recovery')
+    rospy.Subscriber('/scan', LaserScan, scan_callback)
 
     client = actionlib.SimpleActionClient('move_base', MoveBaseAction)
     rospy.loginfo("Waiting for move_base action server...")
@@ -28,49 +37,106 @@ def send_goal_with_recovery(x, y, yaw_rad):
         goal.target_pose.pose.orientation.z = q[2]
         goal.target_pose.pose.orientation.w = q[3]
 
-        rospy.loginfo("Sending goal")
+        rospy.loginfo("Sending goal: (%.2f, %.2f, %.1f°)" % (x, y, yaw_rad * 180.0 / math.pi))
         client.send_goal(goal)
 
+    def enough_space_for_turn():
+        rospy.sleep(0.5)
+        global scan_data
+        if scan_data is None:
+            rospy.logwarn("No scan data available!")
+            return False
+
+        min_clear_distance = 1.0  # meters
+        angle_range_deg = 90
+
+        angle_min = scan_data.angle_min
+        angle_increment = scan_data.angle_increment
+        ranges = scan_data.ranges
+
+        total_angles = len(ranges)
+        angle_center_index = int((0 - angle_min) / angle_increment)
+        angle_half_range = int(math.radians(angle_range_deg) / angle_increment)
+
+        start_index = max(0, angle_center_index - angle_half_range)
+        end_index = min(total_angles - 1, angle_center_index + angle_half_range)
+
+        for i in range(start_index, end_index + 1):
+            dist = ranges[i]
+            if not math.isinf(dist) and dist < min_clear_distance:
+                rospy.logwarn("Obstacle detected at index %d: %.2f m" % (i, dist))
+                return False
+
+        return True
+
     def perform_recovery():
-        rospy.logwarn("Goal failed. Performing recovery: rotating in place for 5 seconds.")
         vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
         twist = Twist()
-        twist.angular.z = 0.5  # Rotate counterclockwise
-
-        # Rotate for 5 seconds
-        start_time = rospy.Time.now()
         rate = rospy.Rate(10)
-        while (rospy.Time.now() - start_time).to_sec() < 5.0 and not rospy.is_shutdown():
+
+        if enough_space_for_turn():
+            rospy.logwarn("Performing 180° turn.")
+            twist.angular.z = 0.5
+            duration = 6.0
+        else:
+            rospy.logwarn("Not enough space. Reversing for 3 seconds.")
+            twist.linear.x = -0.2
+            duration = 3.0
+
+        start_time = rospy.Time.now()
+        while (rospy.Time.now() - start_time).to_sec() < duration and not rospy.is_shutdown():
             vel_pub.publish(twist)
             rate.sleep()
 
-        # Stop rotation
-        twist.angular.z = 0.0
-        vel_pub.publish(twist)
+        vel_pub.publish(Twist())
         rospy.sleep(1.0)
 
-    # Send initial goal
+    # First attempt
     send_goal()
-
-    # Wait for result with timeout
     success = client.wait_for_result(rospy.Duration(30.0))
     state = client.get_state()
 
     if not success or state != actionlib.GoalStatus.SUCCEEDED:
         rospy.logwarn("Goal did not succeed. State: %d", state)
         perform_recovery()
-
-        # Retry the goal after recovery
         rospy.loginfo("Retrying goal after recovery...")
         send_goal()
         client.wait_for_result()
-        rospy.loginfo("Final navigation result: %s", client.get_state())
+
+    # Final result
+    final_state = client.get_state()
+    status_text = [
+        "PENDING", "ACTIVE", "PREEMPTED", "SUCCEEDED", "ABORTED",
+        "REJECTED", "PREEMPTING", "RECALLING", "RECALLED", "LOST"
+    ]
+    if final_state == actionlib.GoalStatus.SUCCEEDED:
+        rospy.loginfo("Final navigation result: SUCCEEDED")
     else:
-        rospy.loginfo("Navigation goal succeeded!")
+        rospy.logwarn("Final navigation result: %s (state code: %d)",
+                      status_text[final_state] if final_state < len(status_text) else "UNKNOWN",
+                      final_state)
 
 if __name__ == '__main__':
     try:
-        send_goal_with_recovery(1.99, 0.32, 0.0)
+        rospy.init_node('dual_goal_navigation_node')
+
+        # Get two goals from user
+        goals = []
+        for i in range(2):
+            print("\n--- Enter Goal %d ---" % (i + 1))
+            x = float(input("Enter goal X: "))
+            y = float(input("Enter goal Y: "))
+            yaw_deg = float(input("Enter yaw (in degrees): "))
+            yaw_rad = yaw_deg * math.pi / 180.0
+            goals.append((x, y, yaw_rad))
+
+        # Send each goal one by one
+        for idx, (gx, gy, gyaw) in enumerate(goals):
+            rospy.loginfo("Navigating to Goal %d..." % (idx + 1))
+            send_goal_with_recovery(gx, gy, gyaw)
+            rospy.sleep(1.0)
+
+        rospy.loginfo("All goals completed.")
     except rospy.ROSInterruptException:
-        rospy.loginfo("Goal interrupted.")
+        rospy.loginfo("Navigation interrupted.")
 
