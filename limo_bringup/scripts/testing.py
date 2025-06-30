@@ -79,9 +79,9 @@ def send_goal_with_recovery(x, y, yaw_rad):
             twist.angular.z = 0.5
             duration = 6.0
         else:
-            rospy.logwarn("Not enough space. Reversing for 3 seconds.")
+            rospy.logwarn("Not enough space. Reversing for 1 second.")
             twist.linear.x = -0.2
-            duration = 3.0
+            duration = 1.0
 
         start_time = rospy.Time.now()
         while (rospy.Time.now() - start_time).to_sec() < duration and not rospy.is_shutdown():
@@ -91,30 +91,23 @@ def send_goal_with_recovery(x, y, yaw_rad):
         vel_pub.publish(Twist())
         rospy.sleep(1.0)
 
-    # First attempt
-    send_goal()
-    success = client.wait_for_result(rospy.Duration(30.0))
-    state = client.get_state()
-
-    if not success or state != actionlib.GoalStatus.SUCCEEDED:
-        rospy.logwarn("Goal did not succeed. State: %d", state)
-        perform_recovery()
-        rospy.loginfo("Retrying goal after recovery...")
+    # Main goal-retrying loop
+    attempt = 0
+    while not rospy.is_shutdown():
+        attempt += 1
+        rospy.loginfo("Attempt #%d: sending goal..." % attempt)
         send_goal()
-        client.wait_for_result()
+        success = client.wait_for_result(rospy.Duration(30.0))
+        state = client.get_state()
 
-    # Final result
-    final_state = client.get_state()
-    status_text = [
-        "PENDING", "ACTIVE", "PREEMPTED", "SUCCEEDED", "ABORTED",
-        "REJECTED", "PREEMPTING", "RECALLING", "RECALLED", "LOST"
-    ]
-    if final_state == actionlib.GoalStatus.SUCCEEDED:
-        rospy.loginfo("Final navigation result: SUCCEEDED")
-    else:
-        rospy.logwarn("Final navigation result: %s (state code: %d)",
-                      status_text[final_state] if final_state < len(status_text) else "UNKNOWN",
-                      final_state)
+        if success and state == actionlib.GoalStatus.SUCCEEDED:
+            rospy.loginfo("Navigation goal SUCCEEDED after %d attempt(s)." % attempt)
+            break
+        else:
+            rospy.logwarn("Navigation FAILED (state: %d). Performing recovery and retrying..." % state)
+            perform_recovery()
+
+    return  # once succeeded
 
 if __name__ == '__main__':
     try:
