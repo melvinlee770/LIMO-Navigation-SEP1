@@ -4,19 +4,52 @@
 import rospy
 import actionlib
 import math
+import tf
 from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Twist
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
 from tf.transformations import quaternion_from_euler
-from geometry_msgs.msg import Twist
 
 scan_data = None
+pose_history = []
 
 def scan_callback(msg):
     global scan_data
     scan_data = msg
 
-def send_goal_with_recovery(x, y, yaw_rad):
+def odom_callback(msg):
+    global pose_history
+    pose = msg.pose.pose
+    pose_history.append((pose.position.x, pose.position.y))
+    if len(pose_history) > 100:  # Keep recent 100 poses
+        pose_history.pop(0)
+
+def get_current_pose():
+    listener = tf.TransformListener()
+    rospy.loginfo("Waiting for transform from map to base_link...")
+    listener.waitForTransform("map", "base_link", rospy.Time(0), rospy.Duration(5.0))
+    (trans, rot) = listener.lookupTransform("map", "base_link", rospy.Time(0))
+    return trans  # [x, y, z]
+
+def compute_yaw_to_goal(current_x, current_y, goal_x, goal_y):
+    dx = goal_x - current_x
+    dy = goal_y - current_y
+    return math.atan2(dy, dx)
+
+def send_goal_with_recovery(x, y):
     rospy.Subscriber('/scan', LaserScan, scan_callback)
+    rospy.Subscriber('/odom', Odometry, odom_callback)
+
+    # Wait until initial scan and odometry are ready
+    rospy.loginfo("Waiting for initial scan and odom data...")
+    rate = rospy.Rate(10)
+    while scan_data is None or len(pose_history) < 2:
+        rate.sleep()
+    rospy.loginfo("Sensor data received.")
+
+    current_x, current_y, _ = get_current_pose()
+    yaw_rad = compute_yaw_to_goal(current_x, current_y, x, y)
 
     client = actionlib.SimpleActionClient('move_base', MoveBaseAction)
     rospy.loginfo("Waiting for move_base action server...")
@@ -71,22 +104,38 @@ def send_goal_with_recovery(x, y, yaw_rad):
 
     def perform_recovery():
         vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
-        twist = Twist()
         rate = rospy.Rate(10)
 
         if enough_space_for_turn():
             rospy.logwarn("Performing 180° turn.")
+            twist = Twist()
             twist.angular.z = 0.5
             duration = 6.0
+            start_time = rospy.Time.now()
+            while (rospy.Time.now() - start_time).to_sec() < duration and not rospy.is_shutdown():
+                vel_pub.publish(twist)
+                rate.sleep()
         else:
-            rospy.logwarn("Not enough space. Reversing for 1 second.")
-            twist.linear.x = -0.2
+            rospy.logwarn("Not enough space. Reversing along path for 1 second.")
             duration = 1.0
+            start_time = rospy.Time.now()
+            while (rospy.Time.now() - start_time).to_sec() < duration and not rospy.is_shutdown():
+                if len(pose_history) < 2:
+                    twist = Twist()
+                    twist.linear.x = -0.2
+                else:
+                    current = pose_history[-1]
+                    previous = pose_history[-2]
+                    dx = current[0] - previous[0]
+                    dy = current[1] - previous[1]
+                    angle = math.atan2(dy, dx)
 
-        start_time = rospy.Time.now()
-        while (rospy.Time.now() - start_time).to_sec() < duration and not rospy.is_shutdown():
-            vel_pub.publish(twist)
-            rate.sleep()
+                    twist = Twist()
+                    twist.linear.x = -0.2
+                    twist.angular.z = 0.0
+
+                vel_pub.publish(twist)
+                rate.sleep()
 
         vel_pub.publish(Twist())
         rospy.sleep(1.0)
@@ -107,26 +156,24 @@ def send_goal_with_recovery(x, y, yaw_rad):
             rospy.logwarn("Navigation FAILED (state: %d). Performing recovery and retrying..." % state)
             perform_recovery()
 
-    return  # once succeeded
+    return
 
 if __name__ == '__main__':
     try:
         rospy.init_node('dual_goal_navigation_node')
 
-        # Get two goals from user
+        # Get two goals from user (yaw auto-calculated)
         goals = []
         for i in range(2):
             print("\n--- Enter Goal %d ---" % (i + 1))
             x = float(input("Enter goal X: "))
             y = float(input("Enter goal Y: "))
-            yaw_deg = float(input("Enter yaw (in degrees): "))
-            yaw_rad = yaw_deg * math.pi / 180.0
-            goals.append((x, y, yaw_rad))
+            goals.append((x, y))
 
-        # Send each goal one by one
-        for idx, (gx, gy, gyaw) in enumerate(goals):
+        # Navigate to each goal
+        for idx, (gx, gy) in enumerate(goals):
             rospy.loginfo("Navigating to Goal %d..." % (idx + 1))
-            send_goal_with_recovery(gx, gy, gyaw)
+            send_goal_with_recovery(gx, gy)
             rospy.sleep(1.0)
 
         rospy.loginfo("All goals completed.")
