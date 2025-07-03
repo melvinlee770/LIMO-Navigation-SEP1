@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+from std_srvs.srv import Empty
 import rospy
 import actionlib
 import math
@@ -22,7 +23,7 @@ def odom_callback(msg):
     global pose_history
     pose = msg.pose.pose
     pose_history.append((pose.position.x, pose.position.y))
-    if len(pose_history) > 100:  # Keep recent 100 poses
+    if len(pose_history) > 100:
         pose_history.pop(0)
 
 def get_current_pose():
@@ -30,7 +31,7 @@ def get_current_pose():
     rospy.loginfo("Waiting for transform from map to base_link...")
     listener.waitForTransform("map", "base_link", rospy.Time(0), rospy.Duration(5.0))
     (trans, rot) = listener.lookupTransform("map", "base_link", rospy.Time(0))
-    return trans  # [x, y, z]
+    return trans
 
 def compute_yaw_to_goal(current_x, current_y, goal_x, goal_y):
     dx = goal_x - current_x
@@ -41,7 +42,6 @@ def send_goal_with_recovery(x, y):
     rospy.Subscriber('/scan', LaserScan, scan_callback)
     rospy.Subscriber('/odom', Odometry, odom_callback)
 
-    # Wait until initial scan and odometry are ready
     rospy.loginfo("Waiting for initial scan and odom data...")
     rate = rospy.Rate(10)
     while scan_data is None or len(pose_history) < 2:
@@ -73,74 +73,112 @@ def send_goal_with_recovery(x, y):
         rospy.loginfo("Sending goal: (%.2f, %.2f, %.1f°)" % (x, y, yaw_rad * 180.0 / math.pi))
         client.send_goal(goal)
 
-    def enough_space_for_turn():
-        rospy.sleep(0.5)
-        global scan_data
-        if scan_data is None:
-            rospy.logwarn("No scan data available!")
-            return False
+    def perform_recovery_with_strategy(attempt):
+        def clear_costmap():
+            rospy.logwarn("Clearing costmap...")
+            try:
+                rospy.wait_for_service('/move_base/clear_costmaps', timeout=2.0)
+                clear_srv = rospy.ServiceProxy('/move_base/clear_costmaps', Empty)
+                clear_srv()
+                rospy.loginfo("Costmap cleared.")
+            except (rospy.ServiceException, rospy.ROSException) as e:
+                rospy.logerr("Costmap clear failed: %s", str(e))
 
-        min_clear_distance = 1.0  # meters
-        angle_range_deg = 90
+        clear_costmap()
 
-        angle_min = scan_data.angle_min
-        angle_increment = scan_data.angle_increment
-        ranges = scan_data.ranges
+        case = ((attempt - 1) % 3) + 1  # Cycles 1 → 2 → 3
 
-        total_angles = len(ranges)
-        angle_center_index = int((0 - angle_min) / angle_increment)
-        angle_half_range = int(math.radians(angle_range_deg) / angle_increment)
+        if case == 1:
+            rospy.logwarn("Recovery Step 1 (cycled): Clear costmap and retry.")
+            return
 
-        start_index = max(0, angle_center_index - angle_half_range)
-        end_index = min(total_angles - 1, angle_center_index + angle_half_range)
+        elif case == 2:
+            rospy.logwarn("Recovery Step 2 (cycled): Check LIDAR, rotate 180° if safe.")
 
-        for i in range(start_index, end_index + 1):
-            dist = ranges[i]
-            if not math.isinf(dist) and dist < min_clear_distance:
-                rospy.logwarn("Obstacle detected at index %d: %.2f m" % (i, dist))
-                return False
+            if scan_data is None:
+                rospy.logwarn("No scan data available! Skipping rotation.")
+                return
 
-        return True
+            angle_min = scan_data.angle_min
+            angle_increment = scan_data.angle_increment
+            ranges = scan_data.ranges
 
-    def perform_recovery():
-        vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
-        rate = rospy.Rate(10)
+            def get_index_for_angle(deg):
+                angle_rad = math.radians(deg)
+                return int((angle_rad - angle_min) / angle_increment)
 
-        if enough_space_for_turn():
-            rospy.logwarn("Performing 180° turn.")
-            twist = Twist()
-            twist.angular.z = 0.5
-            duration = 6.0
-            start_time = rospy.Time.now()
-            while (rospy.Time.now() - start_time).to_sec() < duration and not rospy.is_shutdown():
-                vel_pub.publish(twist)
-                rate.sleep()
+            vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
+            rate = rospy.Rate(10)
+
+            def rotate_left():
+                twist = Twist()
+                twist.angular.z = 0.5
+                duration = math.pi / 0.5
+                start_time = rospy.Time.now()
+                rospy.loginfo("Turning LEFT 180°...")
+                while (rospy.Time.now() - start_time).to_sec() < duration and not rospy.is_shutdown():
+                    vel_pub.publish(twist)
+                    rate.sleep()
+                vel_pub.publish(Twist())
+                rospy.sleep(1.0)
+
+            def rotate_right():
+                twist = Twist()
+                twist.angular.z = -0.5
+                duration = math.pi / 0.5
+                start_time = rospy.Time.now()
+                rospy.loginfo("Turning RIGHT 180°...")
+                while (rospy.Time.now() - start_time).to_sec() < duration and not rospy.is_shutdown():
+                    vel_pub.publish(twist)
+                    rate.sleep()
+                vel_pub.publish(Twist())
+                rospy.sleep(1.0)
+
+            front_index = get_index_for_angle(0)
+            left_index = get_index_for_angle(90)
+            right_index = get_index_for_angle(-90)
+
+            front_clear = False
+            left_clear = False
+            right_clear = False
+
+            if 0 <= front_index < len(ranges):
+                dist = ranges[front_index]
+                if not math.isinf(dist) and not math.isnan(dist) and dist >= 0.08:
+                    front_clear = True
+
+            if 0 <= left_index < len(ranges):
+                dist = ranges[left_index]
+                if not math.isinf(dist) and not math.isnan(dist) and dist >= 0.08:
+                    left_clear = True
+
+            if 0 <= right_index < len(ranges):
+                dist = ranges[right_index]
+                if not math.isinf(dist) and not math.isnan(dist) and dist >= 0.08:
+                    right_clear = True
+
+            if front_clear and left_clear:
+                rotate_left()
+            elif front_clear and right_clear:
+                rotate_right()
+            else:
+                rospy.logwarn("Not enough clearance to rotate left or right.")
+                return
+
         else:
-            rospy.logwarn("Not enough space. Reversing along path for 1 second.")
-            duration = 1.0
+            rospy.logwarn("Recovery Step 3 (cycled): Clear costmap, reverse for 0.5s, then retry.")
+            vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
+            rate = rospy.Rate(10)
+            twist = Twist()
+            twist.linear.x = -0.2
+            duration = 0.5
             start_time = rospy.Time.now()
             while (rospy.Time.now() - start_time).to_sec() < duration and not rospy.is_shutdown():
-                if len(pose_history) < 2:
-                    twist = Twist()
-                    twist.linear.x = -0.2
-                else:
-                    current = pose_history[-1]
-                    previous = pose_history[-2]
-                    dx = current[0] - previous[0]
-                    dy = current[1] - previous[1]
-                    angle = math.atan2(dy, dx)
-
-                    twist = Twist()
-                    twist.linear.x = -0.2
-                    twist.angular.z = 0.0
-
                 vel_pub.publish(twist)
                 rate.sleep()
+            vel_pub.publish(Twist())
+            rospy.sleep(1.0)
 
-        vel_pub.publish(Twist())
-        rospy.sleep(1.0)
-
-    # Main goal-retrying loop
     attempt = 0
     while not rospy.is_shutdown():
         attempt += 1
@@ -154,7 +192,7 @@ def send_goal_with_recovery(x, y):
             break
         else:
             rospy.logwarn("Navigation FAILED (state: %d). Performing recovery and retrying..." % state)
-            perform_recovery()
+            perform_recovery_with_strategy(attempt)
 
     return
 
@@ -162,7 +200,6 @@ if __name__ == '__main__':
     try:
         rospy.init_node('dual_goal_navigation_node')
 
-        # Get two goals from user (yaw auto-calculated)
         goals = []
         for i in range(2):
             print("\n--- Enter Goal %d ---" % (i + 1))
@@ -170,7 +207,6 @@ if __name__ == '__main__':
             y = float(input("Enter goal Y: "))
             goals.append((x, y))
 
-        # Navigate to each goal
         for idx, (gx, gy) in enumerate(goals):
             rospy.loginfo("Navigating to Goal %d..." % (idx + 1))
             send_goal_with_recovery(gx, gy)
