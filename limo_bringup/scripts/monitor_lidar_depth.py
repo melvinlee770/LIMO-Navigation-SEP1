@@ -1,58 +1,58 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
 import rospy
-import math
-import numpy as np
-from sensor_msgs.msg import LaserScan
-from std_msgs.msg import String
+from nav_msgs.msg import Odometry
+import signal
 
-class LidarSideMonitor:
+class OdomRecorder:
     def __init__(self):
-        rospy.init_node('lidar_side_monitor')
+        self.poses = []
+        self.current_pose = None
+        self.shutdown_requested = False
+        rospy.Subscriber("/odom", Odometry, self.odom_callback)
+        rospy.loginfo("Odom Pose Recorder started.")
+        rospy.loginfo("Press Enter to record current odom pose.")
 
-        rospy.Subscriber('/scan', LaserScan, self.lidar_callback)
+        # Register Ctrl+C handler
+        signal.signal(signal.SIGINT, self.signal_handler)
 
-        # Publisher for human-readable output
-        self.pub = rospy.Publisher('/lidar_side_data', String, queue_size=10)
+    def odom_callback(self, msg):
+        self.current_pose = msg.pose.pose
 
-        rospy.spin()
+    def signal_handler(self, sig, frame):
+        rospy.loginfo("\nCtrl+C detected. Exiting and saving recorded poses...")
+        self.shutdown_requested = True
 
-    def lidar_callback(self, msg):
-        ranges = np.array(msg.ranges)
-        angle_min = msg.angle_min
-        angle_increment = msg.angle_increment
-        num_ranges = len(ranges)
+    def run(self):
+        while not rospy.is_shutdown() and not self.shutdown_requested:
+            try:
+                raw_input()  # Wait for Enter key (Python 2)
+            except EOFError:
+                break
+            except KeyboardInterrupt:
+                break
 
-        # Convert degrees to index
-        def get_index(deg):
-            rad = math.radians(deg)
-            idx = int((rad - angle_min) / angle_increment)
-            return max(0, min(idx, num_ranges - 1))
+            if self.current_pose is None:
+                rospy.logwarn("No odometry received yet.")
+                continue
 
-        # Indices for front (0°), left (90°), right (-90°)
-        idx_front = get_index(0)
-        idx_left = get_index(90)
-        idx_right = get_index(-90)
+            pose = self.current_pose
+            x = pose.position.x
+            y = pose.position.y
 
-        def safe_value(val):
-            return round(val, 2) if not math.isnan(val) and not math.isinf(val) else -1
+            self.poses.append((x, y))
+            rospy.loginfo("Recorded pose: x=%.2f, y=%.2f", x, y)
 
-        dist_front = safe_value(ranges[idx_front])
-        dist_left = safe_value(ranges[idx_left])
-        dist_right = safe_value(ranges[idx_right])
+    def save_poses(self, filename="odom_recorded_poses.txt"): #change filename
+        with open(filename, "w") as f:
+            for x, y in self.poses:
+                f.write("%.3f %.3f\n" % (x, y))
+        rospy.loginfo("Saved %d poses to %s", len(self.poses), filename)
 
-        # Log the values
-        rospy.loginfo("LIDAR - Front: %.2f m | Left: %.2f m | Right: %.2f m",
-                      dist_front, dist_left, dist_right)
-
-        status = "Front: %.2f m | Left: %.2f m | Right: %.2f m" % (
-            dist_front, dist_left, dist_right)
-        self.pub.publish(status)
-
-if __name__ == '__main__':
+if __name__ == "__main__":
+    rospy.init_node("odom_pose_recorder")
+    recorder = OdomRecorder()
     try:
-        LidarSideMonitor()
-    except rospy.ROSInterruptException:
-        pass
+        recorder.run()
+    finally:
+        recorder.save_poses()
 

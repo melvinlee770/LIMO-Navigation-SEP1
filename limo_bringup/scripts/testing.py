@@ -6,6 +6,7 @@ import rospy
 import actionlib
 import math
 import tf
+import random
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
@@ -81,22 +82,23 @@ def send_goal_with_recovery(x, y):
                 clear_srv = rospy.ServiceProxy('/move_base/clear_costmaps', Empty)
                 clear_srv()
                 rospy.loginfo("Costmap cleared.")
+                rospy.sleep(3.0)
             except (rospy.ServiceException, rospy.ROSException) as e:
                 rospy.logerr("Costmap clear failed: %s", str(e))
 
         clear_costmap()
 
-        case = ((attempt - 1) % 3) + 1  # Cycles 1 → 2 → 3
+        case = ((attempt - 1) % 3) + 1
 
         if case == 1:
             rospy.logwarn("Recovery Step 1 (cycled): Clear costmap and retry.")
             return
 
         elif case == 2:
-            rospy.logwarn("Recovery Step 2 (cycled): Check LIDAR, rotate 180° if safe.")
+            rospy.logwarn("Recovery Step 2 (cycled): Perform Random Jitter with LIDAR clearance check.")
 
             if scan_data is None:
-                rospy.logwarn("No scan data available! Skipping rotation.")
+                rospy.logwarn("No scan data available! Skipping jitter.")
                 return
 
             angle_min = scan_data.angle_min
@@ -107,63 +109,30 @@ def send_goal_with_recovery(x, y):
                 angle_rad = math.radians(deg)
                 return int((angle_rad - angle_min) / angle_increment)
 
+            front_index = get_index_for_angle(0)
+            if 0 <= front_index < len(ranges):
+                dist = ranges[front_index]
+                if math.isinf(dist) or math.isnan(dist) or dist < 0.10:
+                    rospy.logwarn("Front too close (%.2fm)! Skipping jitter." % dist)
+                    return
+
             vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
             rate = rospy.Rate(10)
 
-            def rotate_left():
-                twist = Twist()
-                twist.angular.z = 0.5
-                duration = math.pi / 0.5
-                start_time = rospy.Time.now()
-                rospy.loginfo("Turning LEFT 180°...")
-                while (rospy.Time.now() - start_time).to_sec() < duration and not rospy.is_shutdown():
-                    vel_pub.publish(twist)
-                    rate.sleep()
-                vel_pub.publish(Twist())
-                rospy.sleep(1.0)
+            twist = Twist()
+            twist.linear.x = random.uniform(-0.1, 0.1)
+            twist.angular.z = random.uniform(-0.4, 0.4)
 
-            def rotate_right():
-                twist = Twist()
-                twist.angular.z = -0.5
-                duration = math.pi / 0.5
-                start_time = rospy.Time.now()
-                rospy.loginfo("Turning RIGHT 180°...")
-                while (rospy.Time.now() - start_time).to_sec() < duration and not rospy.is_shutdown():
-                    vel_pub.publish(twist)
-                    rate.sleep()
-                vel_pub.publish(Twist())
-                rospy.sleep(1.0)
+            rospy.loginfo("Jittering with linear.x: %.3f, angular.z: %.3f",
+                          twist.linear.x, twist.angular.z)
 
-            front_index = get_index_for_angle(0)
-            left_index = get_index_for_angle(90)
-            right_index = get_index_for_angle(-90)
+            start_time = rospy.Time.now()
+            while (rospy.Time.now() - start_time).to_sec() < 0.6 and not rospy.is_shutdown():
+                vel_pub.publish(twist)
+                rate.sleep()
 
-            front_clear = False
-            left_clear = False
-            right_clear = False
-
-            if 0 <= front_index < len(ranges):
-                dist = ranges[front_index]
-                if not math.isinf(dist) and not math.isnan(dist) and dist >= 0.08:
-                    front_clear = True
-
-            if 0 <= left_index < len(ranges):
-                dist = ranges[left_index]
-                if not math.isinf(dist) and not math.isnan(dist) and dist >= 0.08:
-                    left_clear = True
-
-            if 0 <= right_index < len(ranges):
-                dist = ranges[right_index]
-                if not math.isinf(dist) and not math.isnan(dist) and dist >= 0.08:
-                    right_clear = True
-
-            if front_clear and left_clear:
-                rotate_left()
-            elif front_clear and right_clear:
-                rotate_right()
-            else:
-                rospy.logwarn("Not enough clearance to rotate left or right.")
-                return
+            vel_pub.publish(Twist())
+            rospy.sleep(1.0)
 
         else:
             rospy.logwarn("Recovery Step 3 (cycled): Clear costmap, reverse for 0.5s, then retry.")
