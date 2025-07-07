@@ -27,6 +27,19 @@ def odom_callback(msg):
     if len(pose_history) > 100:
         pose_history.pop(0)
 
+def get_footprint_length():
+    try:
+        footprint = rospy.get_param("/move_base/local_costmap/footprint")
+        if isinstance(footprint, str):
+            import ast
+            footprint = ast.literal_eval(footprint)
+        xs = [point[0] for point in footprint]
+        length = max(xs) - min(xs)
+        return abs(length)
+    except:
+        rospy.logwarn("Could not get robot footprint. Using default length 0.4m.")
+        return 0.4
+
 def get_current_pose():
     listener = tf.TransformListener()
     rospy.loginfo("Waiting for transform from map to base_link...")
@@ -75,8 +88,10 @@ def send_goal_with_recovery(x, y):
         client.send_goal(goal)
 
     def perform_recovery_with_strategy(attempt):
-        def clear_costmap():
-            rospy.logwarn("Clearing costmap...")
+        case = ((attempt - 1) % 4) + 1
+
+        if case == 1:
+            rospy.logwarn("Recovery Step 1 (cycled): Clear costmap and retry.")
             try:
                 rospy.wait_for_service('/move_base/clear_costmaps', timeout=2.0)
                 clear_srv = rospy.ServiceProxy('/move_base/clear_costmaps', Empty)
@@ -85,13 +100,6 @@ def send_goal_with_recovery(x, y):
                 rospy.sleep(3.0)
             except (rospy.ServiceException, rospy.ROSException) as e:
                 rospy.logerr("Costmap clear failed: %s", str(e))
-
-        clear_costmap()
-
-        case = ((attempt - 1) % 3) + 1
-
-        if case == 1:
-            rospy.logwarn("Recovery Step 1 (cycled): Clear costmap and retry.")
             return
 
         elif case == 2:
@@ -134,13 +142,61 @@ def send_goal_with_recovery(x, y):
             vel_pub.publish(Twist())
             rospy.sleep(1.0)
 
-        else:
-            rospy.logwarn("Recovery Step 3 (cycled): Clear costmap, reverse for 0.5s, then retry.")
+        elif case == 3:
+            rospy.logwarn("Recovery Step 3 (cycled): Temporary nearby goal + return to previous pose")
+            try:
+                current_x, current_y, _ = get_current_pose()
+                offset = 0.05
+                temp_goal_x = current_x + offset
+                temp_goal_y = current_y
+
+                temp_goal = MoveBaseGoal()
+                temp_goal.target_pose.header.frame_id = "map"
+                temp_goal.target_pose.header.stamp = rospy.Time.now()
+                temp_goal.target_pose.pose.position.x = temp_goal_x
+                temp_goal.target_pose.pose.position.y = temp_goal_y
+                q = quaternion_from_euler(0, 0, 0)
+                temp_goal.target_pose.pose.orientation.x = q[0]
+                temp_goal.target_pose.pose.orientation.y = q[1]
+                temp_goal.target_pose.pose.orientation.z = q[2]
+                temp_goal.target_pose.pose.orientation.w = q[3]
+
+                client.send_goal(temp_goal)
+                success = client.wait_for_result(rospy.Duration(10.0))
+                rospy.loginfo("Temporary goal result: %s", str(success))
+
+                if len(pose_history) >= 5:
+                    prev_x, prev_y = pose_history[-5]
+                    rospy.loginfo("Returning to previous pose (%.2f, %.2f)", prev_x, prev_y)
+
+                    return_goal = MoveBaseGoal()
+                    return_goal.target_pose.header.frame_id = "map"
+                    return_goal.target_pose.header.stamp = rospy.Time.now()
+                    return_goal.target_pose.pose.position.x = prev_x
+                    return_goal.target_pose.pose.position.y = prev_y
+                    q = quaternion_from_euler(0, 0, 0)
+                    return_goal.target_pose.pose.orientation.x = q[0]
+                    return_goal.target_pose.pose.orientation.y = q[1]
+                    return_goal.target_pose.pose.orientation.z = q[2]
+                    return_goal.target_pose.pose.orientation.w = q[3]
+
+                    client.send_goal(return_goal)
+                    client.wait_for_result(rospy.Duration(10.0))
+                else:
+                    rospy.logwarn("Not enough pose history to return to previous pose.")
+            except Exception as e:
+                rospy.logerr("Error during Recovery Step 3: %s", str(e))
+
+        elif case == 4:
+            rospy.logwarn("Recovery Step 4 (cycled): Reverse based on footprint.")
             vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
             rate = rospy.Rate(10)
             twist = Twist()
             twist.linear.x = -0.2
-            duration = 0.5
+
+            footprint_length = get_footprint_length()
+            duration = footprint_length / abs(twist.linear.x)
+
             start_time = rospy.Time.now()
             while (rospy.Time.now() - start_time).to_sec() < duration and not rospy.is_shutdown():
                 vel_pub.publish(twist)
@@ -163,14 +219,13 @@ def send_goal_with_recovery(x, y):
             rospy.logwarn("Navigation FAILED (state: %d). Performing recovery and retrying..." % state)
             perform_recovery_with_strategy(attempt)
 
-    return
-
 if __name__ == '__main__':
     try:
         rospy.init_node('dual_goal_navigation_node')
 
         goals = []
-        for i in range(2):
+        num_goals = int(input("How many goals do you want to set? "))
+        for i in range(num_goals):
             print("\n--- Enter Goal %d ---" % (i + 1))
             x = float(input("Enter goal X: "))
             y = float(input("Enter goal Y: "))
