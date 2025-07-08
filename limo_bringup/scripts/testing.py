@@ -15,6 +15,8 @@ from tf.transformations import quaternion_from_euler
 
 scan_data = None
 pose_history = []
+listener = None
+cmd_vel_pub = None
 
 def scan_callback(msg):
     global scan_data
@@ -36,34 +38,31 @@ def get_footprint_length():
         xs = [point[0] for point in footprint]
         length = max(xs) - min(xs)
         return abs(length)
-    except:
-        rospy.logwarn("Could not get robot footprint. Using default length 0.4m.")
+    except (rospy.ROSException, ValueError, SyntaxError) as e:
+        rospy.logwarn("Could not get robot footprint. Using default length 0.4m. Error: %s", str(e))
         return 0.4
 
 def get_current_pose():
-    listener = tf.TransformListener()
+    if listener is None: # Safety check (though main should initialize it)
+        rospy.logerr("TF listener not initialized in get_current_pose!")
+        return None, None, None # Indicate failure
     rospy.loginfo("Waiting for transform from map to base_link...")
     listener.waitForTransform("map", "base_link", rospy.Time(0), rospy.Duration(5.0))
     (trans, rot) = listener.lookupTransform("map", "base_link", rospy.Time(0))
     return trans
 
-def compute_yaw_to_goal(current_x, current_y, goal_x, goal_y):
-    dx = goal_x - current_x
-    dy = goal_y - current_y
-    return math.atan2(dy, dx)
-
 def send_goal_with_recovery(x, y):
-    rospy.Subscriber('/scan', LaserScan, scan_callback)
-    rospy.Subscriber('/odom', Odometry, odom_callback)
 
-    rospy.loginfo("Waiting for initial scan and odom data...")
+    rospy.loginfo("Waiting for initial scan and odom data for this goal...")
     rate = rospy.Rate(10)
     while scan_data is None or len(pose_history) < 2:
         rate.sleep()
     rospy.loginfo("Sensor data received.")
 
     current_x, current_y, _ = get_current_pose()
-    yaw_rad = compute_yaw_to_goal(current_x, current_y, x, y)
+    if current_x is None: # ADDED: Check for TF lookup failure
+        rospy.logwarn("Failed to get current pose for goal calculation. Skipping this goal.")
+        return # Exit if we can't get current pose
 
     client = actionlib.SimpleActionClient('move_base', MoveBaseAction)
     rospy.loginfo("Waiting for move_base action server...")
@@ -78,13 +77,13 @@ def send_goal_with_recovery(x, y):
         goal.target_pose.pose.position.y = y
         goal.target_pose.pose.position.z = 0
 
-        q = quaternion_from_euler(0, 0, yaw_rad)
+        q = quaternion_from_euler(0, 0, 0)
         goal.target_pose.pose.orientation.x = q[0]
         goal.target_pose.pose.orientation.y = q[1]
         goal.target_pose.pose.orientation.z = q[2]
         goal.target_pose.pose.orientation.w = q[3]
 
-        rospy.loginfo("Sending goal: (%.2f, %.2f, %.1f°)" % (x, y, yaw_rad * 180.0 / math.pi))
+        rospy.loginfo("Sending goal: (%.2f, %.2f)" % (x, y))
         client.send_goal(goal)
 
     def perform_recovery_with_strategy(attempt):
@@ -124,9 +123,6 @@ def send_goal_with_recovery(x, y):
                     rospy.logwarn("Front too close (%.2fm)! Skipping jitter." % dist)
                     return
 
-            vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
-            rate = rospy.Rate(10)
-
             twist = Twist()
             twist.linear.x = random.uniform(-0.1, 0.1)
             twist.angular.z = random.uniform(-0.4, 0.4)
@@ -136,16 +132,18 @@ def send_goal_with_recovery(x, y):
 
             start_time = rospy.Time.now()
             while (rospy.Time.now() - start_time).to_sec() < 0.6 and not rospy.is_shutdown():
-                vel_pub.publish(twist)
-                rate.sleep()
-
-            vel_pub.publish(Twist())
+                cmd_vel_pub.publish(twist) # Use global publisher
+                rate.sleep() # Reusing 'rate' defined at the top of send_goal_with_recovery
+            cmd_vel_pub.publish(Twist()) # Stop the robot
             rospy.sleep(1.0)
 
         elif case == 3:
             rospy.logwarn("Recovery Step 3 (cycled): Temporary nearby goal + return to previous pose")
             try:
                 current_x, current_y, _ = get_current_pose()
+  		if current_x is None:
+                    rospy.logwarn("Could not get current pose for recovery step 3.")
+                    return
                 offset = 0.05
                 temp_goal_x = current_x + offset
                 temp_goal_y = current_y
@@ -187,22 +185,20 @@ def send_goal_with_recovery(x, y):
             except Exception as e:
                 rospy.logerr("Error during Recovery Step 3: %s", str(e))
 
-        elif case == 4:
-            rospy.logwarn("Recovery Step 4 (cycled): Reverse based on footprint.")
-            vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
-            rate = rospy.Rate(10)
-            twist = Twist()
-            twist.linear.x = -0.2
+	elif case == 4:
+    		rospy.logwarn("Recovery Step 4 (cycled): Reverse for 0.3 seconds.")
+    		twist = Twist()
+            	twist.linear.x = -0.2  # reverse speed
 
-            footprint_length = get_footprint_length()
-            duration = footprint_length / abs(twist.linear.x)
+            	duration = 0.3  # reverse for exactly 0.3 seconds
 
-            start_time = rospy.Time.now()
-            while (rospy.Time.now() - start_time).to_sec() < duration and not rospy.is_shutdown():
-                vel_pub.publish(twist)
-                rate.sleep()
-            vel_pub.publish(Twist())
-            rospy.sleep(1.0)
+            	start_time = rospy.Time.now()
+            	while (rospy.Time.now() - start_time).to_sec() < duration and not rospy.is_shutdown():
+                	cmd_vel_pub.publish(twist) # Use global publisher
+                	rate.sleep() # Reusing 'rate' defined at the top of send_goal_with_recovery
+            		cmd_vel_pub.publish(Twist())  # stop the robot
+    		rospy.sleep(1.0)
+
 
     attempt = 0
     while not rospy.is_shutdown():
@@ -222,6 +218,21 @@ def send_goal_with_recovery(x, y):
 if __name__ == '__main__':
     try:
         rospy.init_node('dual_goal_navigation_node')
+	rospy.Subscriber('/scan', LaserScan, scan_callback)
+    	rospy.Subscriber('/odom', Odometry, odom_callback)
+	listener = tf.TransformListener()
+	cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1) # ADDED: Initialize cmd_vel_pub
+	rospy.loginfo("Waiting for initial sensor data (scan and odom) in main...")
+        initial_rate = rospy.Rate(10)
+        while scan_data is None or len(pose_history) < 2:
+            initial_rate.sleep()
+        rospy.loginfo("Initial sensor data received in main.")
+
+        try:
+            listener.waitForTransform("map", "base_link", rospy.Time(0), rospy.Duration(5.0))
+            rospy.loginfo("Initial TF transform available in main.")
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+            rospy.logerr("Initial TF transform failed: %s. Navigation might be affected.", str(e))
 
         goals = []
         num_goals = int(input("How many goals do you want to set? "))

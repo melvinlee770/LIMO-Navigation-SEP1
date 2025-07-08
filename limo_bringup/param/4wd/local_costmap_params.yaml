@@ -12,7 +12,6 @@ local_costmap:
   cost_scaling_factor: 7
 inflation_radius: 0.016
 
-footprint: [[0.2, 0.15], [0.2, -0.15], [-0.2, -0.15], [-0.2, 0.15]]
 
 plugins:
   - {name: obstacles_laser,           type: "costmap_2d::ObstacleLayer"}
