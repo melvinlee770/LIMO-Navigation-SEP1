@@ -1,23 +1,26 @@
+# Modified full version of your original code with "person" detection avoidance logic
+
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+from std_srvs.srv import Empty
 import rospy
 import actionlib
 import math
 import tf
 import random
-from std_srvs.srv import Empty
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
-from actionlib_msgs.msg import GoalStatus
 from tf.transformations import quaternion_from_euler
+from darknet_ros_msgs.msg import BoundingBoxes  # NEW: Import YOLO detection message type
 
 scan_data = None
 pose_history = []
 listener = None
 cmd_vel_pub = None
+person_detected = False  # NEW: Flag to track if a person is detected
 
 def scan_callback(msg):
     global scan_data
@@ -30,37 +33,28 @@ def odom_callback(msg):
     if len(pose_history) > 100:
         pose_history.pop(0)
 
-def euclid(a, b):
-    return math.hypot(a[0] - b[0], a[1] - b[1])
+# NEW: Callback to listen to YOLO bounding boxes and detect persons
+def yolo_callback(msg):
+    global person_detected
+    person_detected = False
+    for box in msg.bounding_boxes:
+        if box.Class.lower() == "person" and box.probability > 0.5:
+            person_detected = True
+            rospy.logwarn("PERSON DETECTED: class='%s' (%.2f%%)" % (box.Class, box.probability * 100))
+            break
 
-def get_arena_centers():
-    centers = {}
-    x, y = map(float, raw_input("Enter x and y for home 'N' (e.g. '1.0 1.0'): ").split())
-    centers['N'] = (x, y, 0.0)
-    for i in range(1, 9):
-        x, y = map(float, raw_input("Enter x and y for arena {} (e.g. '2.0 2.0'): ".format(i)).split())
-        centers[i] = (x, y, 0.0)
-    return centers
-
-def get_chosen_arenas():
-    while True:
-        entries = raw_input("Enter two arena IDs to visit, separated by space (e.g. '3 7'): ").split()
-        if len(entries) == 2:
-            try:
-                a1, a2 = int(entries[0]), int(entries[1])
-                if a1 in range(1, 9) and a2 in range(1, 9) and a1 != a2:
-                    return [a1, a2]
-            except ValueError:
-                pass
-        print("Invalid input. Please enter two distinct numbers from 1 to 8.")
-
-def pick_and_order(centers, chosen):
-    P0 = centers['N']
-    P1 = centers[chosen[0]]
-    P2 = centers[chosen[1]]
-    tour_A = euclid(P0, P1) + euclid(P1, P2)
-    tour_B = euclid(P0, P2) + euclid(P2, P1)
-    return chosen if tour_A <= tour_B else list(reversed(chosen))
+def get_footprint_length():
+    try:
+        footprint = rospy.get_param("/move_base/local_costmap/footprint")
+        if isinstance(footprint, str):
+            import ast
+            footprint = ast.literal_eval(footprint)
+        xs = [point[0] for point in footprint]
+        length = max(xs) - min(xs)
+        return abs(length)
+    except (rospy.ROSException, ValueError, SyntaxError) as e:
+        rospy.logwarn("Could not get robot footprint. Using default length 0.4m. Error: %s", str(e))
+        return 0.4
 
 def get_current_pose():
     if listener is None:
@@ -78,6 +72,16 @@ def send_goal_with_recovery(x, y):
         rate.sleep()
     rospy.loginfo("Sensor data received.")
 
+    # NEW: Wait if person is detected before proceeding to send goal
+    if person_detected:
+        rospy.logwarn("Person detected ahead! Waiting before proceeding.")
+        wait_start = rospy.Time.now()
+        while person_detected and not rospy.is_shutdown():
+            if (rospy.Time.now() - wait_start).to_sec() > 15.0:
+                rospy.logwarn("Still detecting person after 15 seconds. Skipping goal for safety.")
+                return
+            rospy.sleep(0.5)
+
     current_x, current_y, _ = get_current_pose()
     if current_x is None:
         rospy.logwarn("Failed to get current pose for goal calculation. Skipping this goal.")
@@ -94,13 +98,126 @@ def send_goal_with_recovery(x, y):
         goal.target_pose.header.stamp = rospy.Time.now()
         goal.target_pose.pose.position.x = x
         goal.target_pose.pose.position.y = y
+        goal.target_pose.pose.position.z = 0
+
         q = quaternion_from_euler(0, 0, 0)
         goal.target_pose.pose.orientation.x = q[0]
         goal.target_pose.pose.orientation.y = q[1]
         goal.target_pose.pose.orientation.z = q[2]
         goal.target_pose.pose.orientation.w = q[3]
+
         rospy.loginfo("Sending goal: (%.2f, %.2f)" % (x, y))
         client.send_goal(goal)
+
+    def perform_recovery_with_strategy(attempt):
+        case = ((attempt - 1) % 4) + 1
+
+        if case == 1:
+            rospy.logwarn("Recovery Step 1 (cycled): Clear costmap and retry.")
+            try:
+                rospy.wait_for_service('/move_base/clear_costmaps', timeout=2.0)
+                clear_srv = rospy.ServiceProxy('/move_base/clear_costmaps', Empty)
+                clear_srv()
+                rospy.loginfo("Costmap cleared.")
+                rospy.sleep(3.0)
+            except (rospy.ServiceException, rospy.ROSException) as e:
+                rospy.logerr("Costmap clear failed: %s", str(e))
+            return
+
+        elif case == 2:
+            rospy.logwarn("Recovery Step 2 (cycled): Perform Random Jitter with LIDAR clearance check.")
+            if scan_data is None:
+                rospy.logwarn("No scan data available! Skipping jitter.")
+                return
+
+            angle_min = scan_data.angle_min
+            angle_increment = scan_data.angle_increment
+            ranges = scan_data.ranges
+
+            def get_index_for_angle(deg):
+                angle_rad = math.radians(deg)
+                return int((angle_rad - angle_min) / angle_increment)
+
+            front_index = get_index_for_angle(0)
+            if 0 <= front_index < len(ranges):
+                dist = ranges[front_index]
+                if math.isinf(dist) or math.isnan(dist) or dist < 0.10:
+                    rospy.logwarn("Front too close (%.2fm)! Skipping jitter." % dist)
+                    return
+
+            twist = Twist()
+            twist.linear.x = random.uniform(-0.1, 0.1)
+            twist.angular.z = random.uniform(-0.4, 0.4)
+
+            rospy.loginfo("Jittering with linear.x: %.3f, angular.z: %.3f",
+                          twist.linear.x, twist.angular.z)
+
+            start_time = rospy.Time.now()
+            while (rospy.Time.now() - start_time).to_sec() < 0.6 and not rospy.is_shutdown():
+                cmd_vel_pub.publish(twist)
+                rate.sleep()
+            cmd_vel_pub.publish(Twist())
+            rospy.sleep(1.0)
+
+        elif case == 3:
+            rospy.logwarn("Recovery Step 3 (cycled): Temporary nearby goal + return to previous pose")
+            try:
+                current_x, current_y, _ = get_current_pose()
+                if current_x is None:
+                    rospy.logwarn("Could not get current pose for recovery step 3.")
+                    return
+                offset = 0.05
+                temp_goal_x = current_x + offset
+                temp_goal_y = current_y
+
+                temp_goal = MoveBaseGoal()
+                temp_goal.target_pose.header.frame_id = "map"
+                temp_goal.target_pose.header.stamp = rospy.Time.now()
+                temp_goal.target_pose.pose.position.x = temp_goal_x
+                temp_goal.target_pose.pose.position.y = temp_goal_y
+                q = quaternion_from_euler(0, 0, 0)
+                temp_goal.target_pose.pose.orientation.x = q[0]
+                temp_goal.target_pose.pose.orientation.y = q[1]
+                temp_goal.target_pose.pose.orientation.z = q[2]
+                temp_goal.target_pose.pose.orientation.w = q[3]
+
+                client.send_goal(temp_goal)
+                success = client.wait_for_result(rospy.Duration(10.0))
+                rospy.loginfo("Temporary goal result: %s", str(success))
+
+                if len(pose_history) >= 5:
+                    prev_x, prev_y = pose_history[-5]
+                    rospy.loginfo("Returning to previous pose (%.2f, %.2f)", prev_x, prev_y)
+
+                    return_goal = MoveBaseGoal()
+                    return_goal.target_pose.header.frame_id = "map"
+                    return_goal.target_pose.header.stamp = rospy.Time.now()
+                    return_goal.target_pose.pose.position.x = prev_x
+                    return_goal.target_pose.pose.position.y = prev_y
+                    q = quaternion_from_euler(0, 0, 0)
+                    return_goal.target_pose.pose.orientation.x = q[0]
+                    return_goal.target_pose.pose.orientation.y = q[1]
+                    return_goal.target_pose.pose.orientation.z = q[2]
+                    return_goal.target_pose.pose.orientation.w = q[3]
+
+                    client.send_goal(return_goal)
+                    client.wait_for_result(rospy.Duration(10.0))
+                else:
+                    rospy.logwarn("Not enough pose history to return to previous pose.")
+            except Exception as e:
+                rospy.logerr("Error during Recovery Step 3: %s", str(e))
+
+        elif case == 4:
+            rospy.logwarn("Recovery Step 4 (cycled): Reverse for 0.3 seconds.")
+            twist = Twist()
+            twist.linear.x = -0.2
+            duration = 0.3
+            start_time = rospy.Time.now()
+            while (rospy.Time.now() - start_time).to_sec() < duration and not rospy.is_shutdown():
+                cmd_vel_pub.publish(twist)
+                rate.sleep()
+            cmd_vel_pub.publish(Twist())
+            rospy.sleep(1.0)
 
     attempt = 0
     while not rospy.is_shutdown():
@@ -109,34 +226,46 @@ def send_goal_with_recovery(x, y):
         send_goal()
         success = client.wait_for_result(rospy.Duration(30.0))
         state = client.get_state()
-        if success and state == GoalStatus.SUCCEEDED:
+
+        if success and state == actionlib.GoalStatus.SUCCEEDED:
             rospy.loginfo("Navigation goal SUCCEEDED after %d attempt(s)." % attempt)
             break
         else:
-            rospy.logwarn("Navigation FAILED (state: %d). Retrying..." % state)
+            rospy.logwarn("Navigation FAILED (state: %d). Performing recovery and retrying..." % state)
+            perform_recovery_with_strategy(attempt)
 
 if __name__ == '__main__':
     try:
         rospy.init_node('dual_goal_navigation_node')
         rospy.Subscriber('/scan', LaserScan, scan_callback)
         rospy.Subscriber('/odom', Odometry, odom_callback)
+        rospy.Subscriber('/darknet_ros/bounding_boxes', BoundingBoxes, yolo_callback)  # NEW: YOLO detection subscription
         listener = tf.TransformListener()
         cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
 
-        rospy.loginfo("Waiting for initial sensor data (scan and odom)...")
+        rospy.loginfo("Waiting for initial sensor data (scan and odom) in main...")
         initial_rate = rospy.Rate(10)
         while scan_data is None or len(pose_history) < 2:
             initial_rate.sleep()
-        rospy.loginfo("Initial sensor data received.")
+        rospy.loginfo("Initial sensor data received in main.")
 
-        centers = get_arena_centers()
-        chosen = get_chosen_arenas()
-        visit_order = pick_and_order(centers, chosen)
+        try:
+            listener.waitForTransform("map", "base_link", rospy.Time(0), rospy.Duration(5.0))
+            rospy.loginfo("Initial TF transform available in main.")
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+            rospy.logerr("Initial TF transform failed: %s. Navigation might be affected.", str(e))
 
-        for idx, arena_id in enumerate(visit_order):
-            x, y, _ = centers[arena_id]
-            rospy.loginfo("Navigating to Arena %d center (%.2f, %.2f)..." % (arena_id, x, y))
-            send_goal_with_recovery(x, y)
+        goals = []
+        num_goals = int(input("How many goals do you want to set? "))
+        for i in range(num_goals):
+            print("\n--- Enter Goal %d ---" % (i + 1))
+            x = float(input("Enter goal X: "))
+            y = float(input("Enter goal Y: "))
+            goals.append((x, y))
+
+        for idx, (gx, gy) in enumerate(goals):
+            rospy.loginfo("Navigating to Goal %d..." % (idx + 1))
+            send_goal_with_recovery(gx, gy)
             rospy.sleep(1.0)
 
         rospy.loginfo("All goals completed.")
