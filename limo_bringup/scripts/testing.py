@@ -1,5 +1,3 @@
-# Modified full version of your original code with "person" detection avoidance logic
-
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
@@ -239,7 +237,7 @@ if __name__ == '__main__':
         rospy.init_node('dual_goal_navigation_node')
         rospy.Subscriber('/scan', LaserScan, scan_callback)
         rospy.Subscriber('/odom', Odometry, odom_callback)
-        rospy.Subscriber('/darknet_ros/bounding_boxes', BoundingBoxes, yolo_callback)  # NEW: YOLO detection subscription
+        rospy.Subscriber('/darknet_ros/bounding_boxes', BoundingBoxes, yolo_callback)
         listener = tf.TransformListener()
         cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
 
@@ -255,13 +253,44 @@ if __name__ == '__main__':
         except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
             rospy.logerr("Initial TF transform failed: %s. Navigation might be affected.", str(e))
 
-        goals = []
-        num_goals = int(input("How many goals do you want to set? "))
-        for i in range(num_goals):
-            print("\n--- Enter Goal %d ---" % (i + 1))
-            x = float(input("Enter goal X: "))
-            y = float(input("Enter goal Y: "))
-            goals.append((x, y))
+        import os
+
+        # ✅ BEGIN GOAL-READING BLOCK — INDENTED!
+        pose_file_path = os.path.join(os.path.dirname(__file__), 'clicked_points.txt')
+        all_goals = []
+
+        try:
+            with open(pose_file_path, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 2:
+                        x, y = map(float, parts[:2])
+                        all_goals.append((x, y))
+        except Exception as e:
+            rospy.logerr("Failed to read pose file: %s", str(e))
+            exit(1)
+
+        print("\nAvailable recorded poses:")
+        for idx, (x, y) in enumerate(all_goals):
+            print("[{}] x = {:.3f}, y = {:.3f}".format(idx, x, y))
+
+        try:
+            total = len(all_goals)
+            num_goals = int(raw_input("\nHow many goals do you want to navigate to? "))
+            if num_goals < 1 or num_goals > total:
+                raise ValueError("Invalid number of goals.")
+
+            print("Enter the indices of the goals you want to navigate to (e.g. 0 2 5):")
+            selected_indices = map(int, raw_input("Indices: ").split())
+
+            if len(selected_indices) != num_goals:
+                raise ValueError("Number of indices does not match number of goals.")
+
+            goals = [all_goals[i] for i in selected_indices]
+        except Exception as e:
+            rospy.logerr("Invalid input: %s", str(e))
+            exit(1)
+        # ✅ END GOAL-READING BLOCK
 
         for idx, (gx, gy) in enumerate(goals):
             rospy.loginfo("Navigating to Goal %d..." % (idx + 1))
