@@ -20,12 +20,12 @@ Clone the repository and catkin_make:
 ```
 
 
-## Usage
+## Usage 1 (scanning)
 
 * Start the base node for limo
 
     ```
-    $ roslaunch limo_bringup limo_start.launch
+    $ roslaunch limo_bringup limo_start.launch pub_odom_tf:=false
     ```
 
 
@@ -33,4 +33,61 @@ Clone the repository and catkin_make:
 
     ```
     $ roslaunch limo_bringup limo_teleop_keyboard.launch
+    ```
+
+
+* Open the Dabai_U3 camera
+
+    ```
+    $ roslaunch astra_camera dabai_u3.launch
+    ```
+
+
+* Run the Rtabmap scanning 
+
+    ```
+    $ roslaunch limo_bringup limo_rtabmap_orbbec.launch
+    ```
+
+
+* Open Rviz GUI for monitoring 
+
+    ```
+    $ roslaunch limo_bringup rtabmap_rviz.launch
+    ```
+
+
+## Usage 2 (navigation)
+
+* Start the base node for limo
+
+    ```
+    $ roslaunch limo_bringup limo_start.launch pub_odom_tf:=false
+    ```
+
+
+* Open the Dabai_U3 camera
+
+    ```
+    $ roslaunch astra_camera dabai_u3.launch
+    ```
+
+
+* Run the Rtabmap localization
+
+    ```
+    $ roslaunch limo_bringup limo_rtabmap_orbbec.launch localization:=true
+    ```
+
+
+* Run the Rtabmap navigation (move_base)
+
+    ```
+    $ roslaunch limo_bringup limo_navigation_rtabmap.launch
+
+
+* Open Rviz GUI for monitoring 
+
+    ```
+    $ roslaunch limo_bringup rtabmap_rviz.launch
     ```
